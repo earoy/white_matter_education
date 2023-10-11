@@ -1,0 +1,350 @@
+---
+title: "SEDA and White Matter Growth"
+author: "Ethan Roy"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(dplyr)
+library(lme4)
+library(nlme)
+library(tidyverse)
+library(ggplot2)
+library(emmeans)
+library(sjPlot)
+library(sjmisc)
+library(MuMIn)
+library(mlVAR)
+library(effects)
+library(lmerTest)
+
+
+GeomSplitViolin <- ggproto("GeomSplitViolin", GeomViolin, draw_group = function(self, data, ..., draw_quantiles = NULL){
+  data <- transform(data, xminv = x - violinwidth * (x - xmin), xmaxv = x + violinwidth * (xmax - x))
+  grp <- data[1,'group']
+  newdata <- plyr::arrange(transform(data, x = if(grp%%2==1) xminv else xmaxv), if(grp%%2==1) y else -y)
+  newdata <- rbind(newdata[1, ], newdata, newdata[nrow(newdata), ], newdata[1, ])
+  newdata[c(1,nrow(newdata)-1,nrow(newdata)), 'x'] <- round(newdata[1, 'x']) 
+  if (length(draw_quantiles) > 0 & !scales::zero_range(range(data$y))) {
+    stopifnot(all(draw_quantiles >= 0), all(draw_quantiles <= 
+                                              1))
+    quantiles <- ggplot2:::create_quantile_segment_frame(data, draw_quantiles)
+    aesthetics <- data[rep(1, nrow(quantiles)), setdiff(names(data), c("x", "y")), drop = FALSE]
+    aesthetics$alpha <- rep(1, nrow(quantiles))
+    both <- cbind(quantiles, aesthetics)
+    quantile_grob <- GeomPath$draw_panel(both, ...)
+    ggplot2:::ggname("geom_split_violin", grid::grobTree(GeomPolygon$draw_panel(newdata, ...), quantile_grob))
+  }
+  else {
+    ggplot2:::ggname("geom_split_violin", GeomPolygon$draw_panel(newdata, ...))
+  }
+})
+
+geom_split_violin <- function (mapping = NULL, data = NULL, stat = "ydensity", position = "identity", ..., draw_quantiles = NULL, trim = TRUE, scale = "area", na.rm = FALSE, show.legend = NA, inherit.aes = TRUE) {
+  layer(data = data, mapping = mapping, stat = stat, geom = GeomSplitViolin, position = position, show.legend = show.legend, inherit.aes = inherit.aes, params = list(trim = trim, scale = scale, draw_quantiles = draw_quantiles, na.rm = na.rm, ...))
+}
+
+
+
+```
+
+## Load Data
+
+```{r, include=F}
+
+## All data except pyAFQ outputs are available through the ABCD data repository
+## https://nda.nih.gov/abcd/
+
+full_data = read.csv('/Users/Ethan/Documents/Stanford/afq/abcd/data/combo_df_bas_flu_mean.csv')
+
+two_obs = full_data %>% select(subjectID,sessionID) %>% 
+  distinct() %>% 
+  group_by(subjectID) %>% 
+  summarise(nobs = n()) %>% 
+  filter(nobs==2)
+
+mri_df = read_tsv('/Users/Ethan/Documents/Stanford/afq/abcd/t1_images/fmriresults01.txt') %>% 
+  slice(-1) %>% 
+  select(src_subject_id, file_source,interview_age) %>% 
+  rename(subjectID = src_subject_id) %>% 
+  mutate(sessionID = if_else(grepl('baselineYear1Arm1',file_source),'Baseline','Year 2')) %>%
+  mutate(age=as.numeric(interview_age)/12) %>%
+  group_by(subjectID) %>%
+  mutate(initial_age = min(age)) %>%
+  ungroup() %>%
+  mutate(age_c= age-initial_age) %>% 
+  select(-interview_age)
+
+family_df = read_csv('/Users/Ethan/Documents/Stanford/afq/abcd/data/family_info.csv')
+family_df = family_df %>%
+  select(src_subject_id,rel_family_id) %>% 
+  unique() %>% 
+  rename(subjectID=src_subject_id)
+
+scanner_info_df = read_csv('/Users/Ethan/Documents/Stanford/afq/abcd/data/scanner_info.csv')
+scanner_info_df = scanner_info_df %>% 
+  select(src_subject_id,mri_info_manufacturer,mri_info_manufacturers.model.name,
+         mri_info_device.serial.number,mri_info_software.version) %>% 
+  drop_na() %>% 
+  unique() %>% 
+  unite('scanner_make_model',mri_info_manufacturer:mri_info_manufacturers.model.name, sep="_")%>% 
+  rename(subjectID=src_subject_id) %>% 
+  mutate(scanner_make_model=as.factor(scanner_make_model),
+         mri_info_device.serial.number=as.factor(mri_info_device.serial.number),
+         mri_info_software.version = as.factor(mri_info_software.version)) %>% 
+  unite('scanner_make_model_soft',scanner_make_model:mri_info_software.version, sep="_")
+
+demo_info = read_csv('/Users/Ethan/Documents/Stanford/afq/abcd/data/subjects.csv')
+
+ses_env_df = read_csv('/Users/Ethan/Documents/Stanford/afq/abcd/data/ses_env_info.csv') %>% 
+  select(-c(site_id_l,demo_prnt_income_v2,demo_prnt_ed_v2))%>%
+  mutate(subjectID = substring(subjectID,5)) %>% 
+  filter(sessionID == 'ses-baseline_year_1_arm_1') %>% 
+  select(-sessionID)
+
+pub_df = read_csv("/Users/Ethan/Documents/Stanford/EdNeuro/ABCD_smarte/pubstatus.csv") %>% 
+  rename(subjectID=src_subject_id,
+         timepoint=eventname) %>% 
+  mutate(timepoint = if_else(timepoint=='baseline_year_1_arm_1',0,1))
+
+full_data = full_data %>% mutate(timepoint = case_when(sessionID=='Baseline'~0,
+                                                       sessionID=='Year 2'~1)) %>% 
+  inner_join(mri_df, by=c('subjectID','sessionID'))%>%
+  inner_join(family_df, by='subjectID') %>% 
+  inner_join(ses_env_df, by=c('subjectID')) %>% 
+  inner_join(scanner_info_df, by='subjectID') %>% 
+  inner_join(pub_df, by=c('subjectID','timepoint')) 
+  
+## Tract Specific dataframes
+arc_l_df = full_data %>% filter(tractID=='ARC_L')
+arc_r_df = full_data %>% filter(tractID=='ARC_R')
+
+arc_df = full_data %>% 
+  filter((tractID=="ARC_L")|(tractID=="ARC_R")) 
+
+
+```
+
+
+
+# Left Arcuate
+
+## Effects at Baseline
+
+```{r, include=F}
+
+arc_l_bas = arc_l_df %>% filter(sessionID=='Baseline')
+
+bas_mod = lmer(dki_fa ~  initial_age + demo_prnt_income_v2 + demo_prnt_ed_v2 + sex + race + led_sch_seda_s_mn_avg_eb   + (1 |site_id_l/rel_family_id/subjectID), data=arc_l_bas)
+
+summary(bas_mod)
+
+
+```
+
+```{r}
+
+arc_r_bas = arc_r_df %>% filter(sessionID=='Baseline')
+
+bas_mod = lmer(dki_fa ~  initial_age + demo_prnt_income_v2 + demo_prnt_ed_v2 + sex + race + led_sch_seda_s_mn_avg_eb  +  scanner_make_model_soft + (1 |site_id_l/rel_family_id/subjectID), data=arc_r_bas)
+
+summary(bas_mod)
+
+
+```
+
+
+
+## Growth Modeling
+
+
+```{r, unconditional growth model}
+
+
+mod0 = lmer(dki_fa ~ age_c + (1 |site_id_l/rel_family_id/subjectID),
+            data=arc_l_df)
+
+baseline_rand_eff = as.data.frame(VarCorr(mod0))
+
+participant_level_var = baseline_rand_eff[1,4]
+family_level_var = baseline_rand_eff[2,4]
+site_level_var = baseline_rand_eff[3,4]
+resid_var = baseline_rand_eff[4,4]
+
+total_var = participant_level_var+family_level_var+site_level_var+resid_var
+
+# participant level ICC --  0.3301332
+(participant_level_var)/total_var
+
+# family level ICC --  [1] 0.2932169
+(family_level_var)/total_var
+
+# site level ICC -- 0.1813117
+(site_level_var)/total_var
+
+summary(mod0)
+
+```
+
+
+
+
+```{r, covariates}
+
+## Add SEDA Intercept
+mod1 = lmer(dki_fa ~  age_c + initial_age + log_inc_needs_RPP + bachelors + fes_youth_sum + 
+                 sex  + mean_pds  + comc_phenx_mean + led_sch_seda_s_mn_avg_eb  + (1 |site_id_l/rel_family_id/subjectID),data=arc_l_df)
+
+anova(mod0,mod1)
+summary(mod1)
+
+# add SEDA Slope
+mod1.1 = lmer(dki_fa ~  age_c + initial_age + log_inc_needs_RPP + bachelors + fes_youth_sum + 
+                 sex  + mean_pds  + comc_phenx_mean + led_sch_seda_s_mn_avg_eb+led_sch_seda_s_mn_coh_eb +(1 |site_id_l/rel_family_id/subjectID), data=arc_l_df)
+
+anova(mod1.1,mod1) # not significant
+
+
+```
+
+```{r, add seda by time interaction}
+
+## SEDA Intercept * Time interaction -- Differences in Growth
+mod2 = lmer(dki_fa ~ age_c + initial_age + log_inc_needs_RPP + bachelors + fes_youth_sum + 
+                 sex  + mean_pds  + comc_phenx_mean + led_sch_seda_s_mn_coh_eb+led_sch_seda_s_mn_avg_eb+led_sch_seda_s_mn_avg_eb:age_c   + (1 |site_id_l/rel_family_id/subjectID), data=arc_l_df)
+anova(mod1.1,mod2) # significant
+summary(mod2)
+
+## SEDA Slope * Time interaction -- Differences in Growth
+mod2.1 = lmer(dki_fa ~ age_c + initial_age + log_inc_needs_RPP + bachelors + fes_youth_sum + 
+                 sex  + mean_pds  + comc_phenx_mean + led_sch_seda_s_mn_avg_eb+led_sch_seda_s_mn_avg_eb:age_c + (1 |site_id_l/rel_family_id/subjectID), data=arc_l_df)
+anova(mod2,mod2.1) # not significant
+
+```
+
+
+```{r, Look at right arcuate}
+
+## Right Arcuate Model
+mod0.7_r_red = lmer(dki_fa ~  initial_age + log_inc_needs_RPP + bachelors + fes_youth_sum + sex  + mean_pds  + comc_phenx_mean + led_sch_seda_s_mn_avg_eb+age_c +  (1 |site_id_l/rel_family_id/subjectID), data=arc_r_df)
+summary(mod0.7_r_red)
+
+
+mod0.7_r = lmer(dki_fa ~  initial_age + log_inc_needs_RPP + bachelors + fes_youth_sum + sex  + mean_pds  + comc_phenx_mean + led_sch_seda_s_mn_avg_eb*age_c +  (1 |site_id_l/rel_family_id/subjectID), data=arc_r_df)
+anova(mod0.7_r,mod0.7_r_red) ## Not significant
+summary(mod0.7_r)
+
+
+```
+
+
+## Bilateral Arcuate Modeling
+
+```{r}
+mod0 = lmer(dki_fa ~ age_c  + (1 |rel_family_id/subjectID), data=arc_df %>% drop_na())
+
+mod0.1 = lmer(dki_fa ~ age_c + tractID + interview_age + log_inc_needs_RPP + bachelors + fes_youth_sum + sex  + mean_pds  + comc_phenx_mean + STATE  + (1 |rel_family_id/subjectID), data=arc_df%>% drop_na())
+anova(mod0,mod0.1) # Significant
+
+# Add SEDA Intercept
+mod0.2 = lmer(dki_fa ~ age_c + tractID + interview_age + log_inc_needs_RPP + bachelors + fes_youth_sum + sex  + mean_pds  + comc_phenx_mean + STATE  + led_sch_seda_s_mn_avg_eb + (1 |rel_family_id/subjectID), data=arc_df%>% drop_na())
+anova(mod0.2,mod0.1) # Significant
+
+# Add Longitudinal SEDA Interaction
+mod0.3 = lmer(dki_fa ~ age_c + tractID + interview_age + log_inc_needs_RPP + bachelors + fes_youth_sum + sex  + mean_pds  + comc_phenx_mean +led_sch_seda_s_mn_avg_eb+led_sch_seda_s_mn_avg_eb*age_c + STATE  + (1 |rel_family_id/subjectID), data=arc_df %>% drop_na())
+anova(mod0.2,mod0.3) # Significant
+
+# Add Hemisphere*SEDA Interaction
+mod0.4 = lmer(dki_fa ~ age_c + interview_age + log_inc_needs_RPP + bachelors + fes_youth_sum + sex  + mean_pds  + comc_phenx_mean +tractID*led_sch_seda_s_mn_avg_eb+led_sch_seda_s_mn_avg_eb*age_c + STATE  + (1 |rel_family_id/subjectID), data=arc_df %>% drop_na())
+anova(mod0.4,mod0.3) # Not Significant
+
+# Add Longitudina*Hemisphere Interaction
+mod0.5 = lmer(dki_fa ~ age_c*tractID + interview_age + log_inc_needs_RPP + bachelors + fes_youth_sum + sex  + mean_pds  + comc_phenx_mean +led_sch_seda_s_mn_avg_eb+led_sch_seda_s_mn_avg_eb*age_c + STATE  + (1 |rel_family_id/subjectID), data=arc_df %>% drop_na())
+anova(mod0.5,mod0.3) # Significant
+
+# Add 3-way Interaction
+mod0.6 = lmer(dki_fa ~ age_c*tractID + interview_age + log_inc_needs_RPP + bachelors + fes_youth_sum + sex  + mean_pds  + comc_phenx_mean +led_sch_seda_s_mn_avg_eb+led_sch_seda_s_mn_avg_eb*age_c + led_sch_seda_s_mn_avg_eb:age_c:tractID + STATE  + (1 |rel_family_id/subjectID), data=arc_df %>% drop_na())
+anova(mod0.5,mod0.6) # Significant
+
+summary(mod0.6)
+
+# Add 3-way Interaction
+mod0.7 = lmer(dki_fa ~  initial_age + log_inc_needs_RPP + bachelors + fes_youth_sum + sex  + mean_pds  + comc_phenx_mean + led_sch_seda_s_mn_avg_eb*age_c*tractID +  (1 |site_id_l/rel_family_id/subjectID), data=arc_df %>% drop_na())
+anova(mod0.5,mod0.6) # Significant
+
+## Look at hemsiphere effects in same model
+
+summary(mod0.7)
+
+
+```
+
+## Figure 3a
+
+```{r figure 3}
+
+plot_df = arc_df %>% drop_na()
+
+plot_df$mean_fa_pred = predict(mod0.7, level=0)
+
+estimates = as.data.frame(Effect(c("age_c","led_sch_seda_s_mn_avg_eb","tractID"),mod0.7,xlevels=3,level=0.66)) %>%
+  filter(led_sch_seda_s_mn_avg_eb!=0.06) %>% 
+  mutate(intercept_group = if_else(led_sch_seda_s_mn_avg_eb>0,"High","Low"),
+         tractID = if_else(tractID=='ARC_L', "Left Arcuate","Right Arcuate"))
+
+mean_pred_df = plot_df %>% filter(dki_fa<0.6) %>% 
+  mutate(intercept_group = case_when(int_quartile==0~"Low",
+                                     int_quartile==1~"Low",
+                                     int_quartile==2~"High",
+                                     int_quartile==3~"High"),
+         age_round = round(age_c)) %>% 
+  group_by(intercept_group,age_round,tractID) %>% 
+  summarise(mean_pred = mean(mean_fa_pred,na.rm=T),
+            se = sd(mean_fa_pred,na.rm=T)/sqrt(n()))
+
+
+plot_df %>% 
+  mutate(intercept_group = case_when(int_quartile==0~"Low",
+                                     int_quartile==1~"Low",
+                                     int_quartile==2~"High",
+                                     int_quartile==3~"High"),
+         age_round = round(age_c),
+         tractID = if_else(tractID=='ARC_L', "Left Arcuate","Right Arcuate")) %>% 
+  ggplot() +
+  geom_split_violin(aes(x=sessionID, y=dki_fa, fill = intercept_group),trim = TRUE,alpha=0.4) +
+    geom_line(data=estimates%>% 
+                 filter(age_c != 2) %>% 
+                 rename(sessionID=age_c) %>% 
+               mutate(sessionID = if_else(sessionID==0,'Baseline','Year 2')),
+            (aes(x=sessionID,y=fit,group=intercept_group)))+
+    geom_errorbar(data = estimates %>%
+                 filter(age_c != 2) %>%
+                 rename(sessionID=age_c) %>%
+               mutate(sessionID = if_else(sessionID==0,'Baseline','Year 2')),
+             aes(x=sessionID,ymin=fit-se, ymax=fit+se),width=0.1)+
+  geom_point(data = estimates %>% 
+                 filter(age_c != 2) %>% 
+                 rename(sessionID=age_c) %>% 
+               mutate(sessionID = if_else(sessionID==0,'Baseline','Year 2')),
+             aes(x=sessionID,y=fit,fill=intercept_group),color='black',pch=21) +
+  theme_classic()+
+  xlab("Timepoint")+
+  ylab("DKI FA")+
+  labs(color = "SEDA Intercept Group", fill = "SEDA Intercept Group")+
+  scale_fill_brewer(palette="Set1")+
+  scale_color_brewer(palette="Set1")+
+  facet_grid(.~tractID)+
+  theme(legend.position = "bottom",
+        legend.text=element_text(size=18))+
+  theme(axis.text=element_text(size=18),
+        axis.title=element_text(size=22),
+        strip.text.x = element_text(size = 18))
+
+
+```
+
+
+
+
+

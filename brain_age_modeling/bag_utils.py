@@ -1,0 +1,260 @@
+import afqinsight as afqi
+import afqinsight.nn.tf_models as nn
+import groupyr as grp
+import matplotlib.pyplot as plt
+import numpy as np
+import os.path as op
+import pandas as pd
+import scipy.stats as stats
+import statsmodels.api as sm
+import statsmodels.formula.api as smf
+import tensorflow as tf
+import tempfile
+
+from afqinsight import AFQDataset
+from afqinsight.plot import plot_tract_profiles
+from afqinsight.match import mahalonobis_dist_match
+from afqinsight import make_afq_regressor_pipeline
+from groupyr.decomposition import GroupPCA
+from neurocombat_sklearn import CombatModel
+from sklearn.ensemble import GradientBoostingRegressor
+from sklearn.impute import SimpleImputer, KNNImputer
+from sklearn.linear_model import LinearRegression, LassoCV
+from sklearn.metrics import mean_squared_error, r2_score, mean_absolute_error
+from sklearn.preprocessing import StandardScaler
+from sklearn.model_selection import train_test_split, cross_val_score, GridSearchCV, KFold, GroupShuffleSplit
+from sklearn.pipeline import Pipeline, make_pipeline
+from sklearn.impute import SimpleImputer
+from skopt import BayesSearchCV
+from skopt.space import Real, Categorical, Integer
+from xgboost import XGBRegressor
+
+
+
+def generate_dataset_splits(dataset, train_prop=1, n_nodes=100):
+    """ Function that takes an AFQDataset and generates train, test
+        and validation splits based on the desired proportion used for
+        training.
+
+        Parameters
+        ----------
+        dataset: AFQDataset 
+            The datasset used for model fitting
+
+        train_prop: int, default=1
+            Proportion of the initial train/test split to use for 
+            training
+
+        n_nodes: int, default=100
+            The number of nodes to use from each bundle when
+            training the model
+
+        Returns
+         -------
+        dict
+            Dictionary object that contains the predictors and outcome variables 
+            for the various splits used for model training
+    """
+
+        
+    target_cols = ['site_id_l','initial_age', 'log_inc_needs_RPP', 'bachelors', 'fes_youth_sum',
+                   'sex', 'mean_pds', 'comc_phenx_mean', 'led_sch_seda_s_mn_avg_eb']
+
+    
+    # create dataframes for the diffusion at behavioral metrics in dataset
+    df_y = pd.DataFrame(index=dataset.subjects, data=dataset.y, columns=dataset.target_cols)
+    df_nodes = pd.DataFrame(data=dataset.X, index=df_y.index)
+    
+    ## Generate Train-Test Split that keeps people with multiple observations in the same train/test split
+    gss = GroupShuffleSplit(n_splits=1, test_size=0.2, random_state=42)
+    train_test_idx, val_idx = next(gss.split(X=df_y, y=df_y['interview_age'], groups=df_y['subjectID_solo']))
+
+
+    # if we want to train on subset of initial train-test split
+    # use train_prop to generate subset of data to train on
+    if train_prop < 1:
+
+        train_idx, test_idx = train_test_split(train_test_idx, train_size=train_prop, random_state=42)
+
+        ## get index of train/test/val subs from df y
+        df_nodes_train = df_nodes.iloc[train_idx]
+        df_nodes_test = df_nodes.iloc[test_idx]
+        df_nodes_val = df_nodes.iloc[val_idx]
+
+        y_train = df_y.iloc[train_idx]
+        y_test = df_y.iloc[test_idx]
+        y_val = df_y.iloc[val_idx]
+        
+    else:
+        
+        df_nodes_train = df_nodes.iloc[train_test_idx]
+        df_nodes_test = df_nodes.iloc[val_idx]
+        df_nodes_val = df_nodes.iloc[val_idx]
+
+        y_train = df_y.iloc[train_test_idx]
+        y_test = df_y.iloc[val_idx]
+        y_val = df_y.iloc[val_idx]
+
+
+    # For keras models, convert tabular bundle data
+    # into tensors for training
+    X_train = afqi.datasets.bundles2channels(
+        df_nodes_train.to_numpy(),
+        n_nodes=n_nodes,
+        n_channels=120, # n_metrics*n_bundles
+        channels_last=True,
+    ).astype(np.float64)
+
+    X_test = afqi.datasets.bundles2channels(
+        df_nodes_test.to_numpy(),
+        n_nodes=n_nodes,
+        n_channels=120,
+        channels_last=True,
+    ).astype(np.float64)
+    
+    X_val = afqi.datasets.bundles2channels(
+        df_nodes_val.to_numpy(),
+        n_nodes=n_nodes,
+        n_channels=120,
+        channels_last=True,
+    ).astype(np.float64)
+
+    
+    return {
+        "X_train": X_train,
+        "y_train": y_train,
+        "X_test": X_test,
+        "y_test": y_test,
+        "X_val": X_val,
+        "y_val": y_val,
+        "groups" : dataset.groups,
+        "feature_names" : dataset.feature_names,
+        "group_names" : dataset.group_names,
+        "df_nodes_train": df_nodes_train,
+        "df_nodes_test": df_nodes_test,
+        "df_nodes_val": df_nodes_val
+    }  
+
+def train_model(dataset, target, epochs=1000, lr=0.01, output_activation="linear", n_classes=1, normative_status=1,trimmed=False):
+    """ Function that takes a dictionary object generated by generate_dataset_splits and
+        trains a resnet model
+
+        Parameters
+        ----------
+        dataset: dict 
+            The dictionary object generaetd by generate_dataset_splits
+
+        target: str
+            Target variable predicted by resnet model
+
+        trimmed: bool, default=False
+            Bool indicating whether or not to train the model on 100 nodes per bundle
+            or trimmed bundle (middle 60 nodes)
+
+        Returns
+         -------
+        dict
+            Dictionary object that contains the model weights as well as predictions for
+            the various train/test/validation splits
+    """
+
+
+    if trimmed:
+        in_shape = (80, 112)
+    else:
+        in_shape = (100, 112)
+    
+    # initiate model
+    model = nn.cnn_resnet(
+        input_shape=in_shape,
+        n_classes=n_classes,
+        output_activation=output_activation,
+    )
+
+    model.compile(
+        optimizer=tf.keras.optimizers.Adam(learning_rate=lr),
+        loss="mean_squared_error",
+        metrics=[
+            'mean_squared_error', 
+            tf.keras.metrics.RootMeanSquaredError(name='rmse'), 
+            'mean_absolute_error'
+        ],
+    )
+    
+    # ModelCheckpoint
+    ckpt_filepath = tempfile.NamedTemporaryFile().name + '.h5'
+    ckpt = tf.keras.callbacks.ModelCheckpoint(
+        filepath = ckpt_filepath,
+        monitor="val_loss",
+        verbose=0,
+        save_best_only=True,
+        save_weights_only=True,
+        mode="auto",
+    )
+    
+    # EarlyStopping
+    early_stopping = tf.keras.callbacks.EarlyStopping(
+        monitor="val_loss",
+        min_delta=0.001,
+        mode="min",
+        patience=100
+    )
+
+    # ReduceLROnPlateau
+    reduce_lr = tf.keras.callbacks.ReduceLROnPlateau(
+        monitor="val_loss",
+        factor=0.2,
+        patience=20,
+        verbose=1
+    )
+    
+    callbacks = [early_stopping, reduce_lr, ckpt]
+    
+    # fit model
+    model.fit(dataset['X_train'].astype(np.float64), 
+              dataset['y_train'][target].astype(np.float64), 
+              epochs=epochs, 
+              validation_split=0.2, 
+              callbacks=callbacks)
+    
+    model.load_weights(ckpt_filepath)
+    
+    # generate predictions for various splits in data
+    df_test = dataset["y_test"].copy()
+    y_pred = model.predict(dataset['X_test'])
+    y_delta_test = y_pred.flatten() - df_test[target].to_numpy().astype(np.float64).flatten().flatten()
+    df_test["bag"] = y_delta_test
+    df_test["y_pred"] = y_pred.flatten()
+    df_test["split"] = "test"
+    
+    df_train = dataset["y_train"].copy()
+    y_pred_train = model.predict(dataset['X_train'])
+    y_delta_train = y_pred_train.flatten() - df_train[target].to_numpy().astype(np.float64).flatten().flatten()
+    df_train["bag"] = y_delta_train
+    df_train["y_pred"] = y_pred_train.flatten()
+    df_train["split"] = "train"
+    
+    df_val = dataset["y_val"].copy()
+    y_pred_val = model.predict(dataset['X_val'])
+    y_delta_val = y_pred_val.flatten() - df_val[target].to_numpy().astype(np.float64).flatten().flatten()
+    df_val["bag"] = y_delta_val
+    df_val["y_pred"] = y_pred_val.flatten()
+    df_val["split"] = "val"
+
+    df = pd.concat([df_test, df_train, df_val])
+
+    # get r2 scores
+    train_score = r2_score(dataset['y_train'][target], y_pred_train)
+    test_score = r2_score(dataset['y_test'][target], y_pred)
+    val_score = r2_score(dataset['y_val'][target], y_pred_val)
+    
+    return dict(
+        model=model.weights,
+        y_pred=y_pred_val,
+        y_test=dataset["y_val"]["interview_age"].to_numpy().astype(np.float64),
+        y_delta=y_delta_val,
+        train_score=train_score,
+        test_score=test_score,
+        val_score=val_score,
+        df=df,
+    )   

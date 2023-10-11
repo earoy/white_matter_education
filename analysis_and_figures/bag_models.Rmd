@@ -1,0 +1,208 @@
+---
+title: "Brain-Age Gap Modeling"
+author: "Ethan Roy"
+output: html_document
+---
+
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(dplyr)
+library(lme4)
+library(nlme)
+library(tidyverse)
+library(ggplot2)
+library(emmeans)
+library(sjPlot)
+library(sjmisc)
+library(MuMIn)
+library(mlVAR)
+library(effects)
+library(lmerTest)
+library(tractr)
+library(gratia)
+```
+
+## Load Data
+
+```{r, include=F}
+
+## bag_df_full.csv generated from dictionary object saved in resnet_abcd_0.70.pkl
+
+whole_brain_bag = read.csv('/Users/Ethan/Documents/Stanford/afq/abcd/data/bag_df_full.csv') %>% 
+  mutate(subjectID = str_sub(X, end = 20),
+         sessionID = str_sub(X, start = 21))
+
+pub_df = read_csv("/Users/Ethan/Documents/Stanford/EdNeuro/ABCD_smarte/pubstatus.csv") %>% 
+  rename(subjectID=src_subject_id,
+         sessionID=eventname)%>% 
+  # filter(sessionID=='baseline_year_1_arm_1') %>%
+  mutate(subjectID = paste0("sub-",subjectID),
+         sessionID = paste0("ses-",sessionID))
+
+seda_info = read_csv('/Users/Ethan/Documents/Stanford/afq/abcd/data/subjects.csv') %>% 
+  select(subjectID,led_sch_seda_s_mn_coh_eb,led_sch_seda_s_mn_avg_eb) %>% 
+  mutate(subjectID = paste0('sub-',subjectID))
+
+family_df = read_csv('/Users/Ethan/Documents/Stanford/afq/abcd/data/family_info.csv')
+
+ses_env_df = read_csv('/Users/Ethan/Documents/Stanford/afq/abcd/data/ses_env_info.csv') %>% 
+  select(-c(demo_prnt_income_v2,demo_prnt_ed_v2))
+  
+family_df = family_df %>%
+  select(src_subject_id,rel_family_id,female) %>% 
+  unique() %>% 
+  rename(subjectID=src_subject_id) %>%
+  mutate(subjectID=paste0('sub-',subjectID),
+         sex = case_when(female=='yes'~"0",
+                         female=='no'~"1")) %>% 
+  select(-female)
+
+full_data_whole_brain = whole_brain_bag %>%
+  inner_join(family_df, by='subjectID')%>% 
+  inner_join(ses_env_df,by=c('subjectID','sessionID')) %>% 
+  inner_join(pub_df,by=c('subjectID','sessionID')) %>% 
+  inner_join(seda_info, by='subjectID') %>%
+  ungroup()%>% 
+  group_by(subjectID) %>%
+  mutate(initial_age = min(interview_age)) %>%
+  ungroup() %>%
+  mutate(age_c= interview_age-initial_age)
+
+
+```
+
+## BAG Model
+
+```{r}
+## Baseline Model
+bag_mod0 = lmer(bag ~  initial_age + log_inc_needs_RPP + bachelors + fes_youth_sum + age_c + 
+                 sex  + mean_pds  + comc_phenx_mean   +  (1 |site_id_l/rel_family_id/subjectID), data=full_data_whole_brain %>% 
+  mutate(sex = as.factor(sex),
+         bachelors = as.factor(bachelors),
+         rel_family_id = as.factor(rel_family_id)) %>% 
+  mutate_if(is.numeric, scale) %>% 
+    drop_na())
+
+summary(bag_mod0)
+
+## Add SEDA Intercept to Model
+bag_mod1 = lmer(bag ~  initial_age + log_inc_needs_RPP + bachelors + fes_youth_sum + age_c + 
+                 sex  + mean_pds  + comc_phenx_mean  +led_sch_seda_s_mn_avg_eb + + (1 |site_id_l/rel_family_id/subjectID), data=full_data_whole_brain %>% 
+  mutate(sex = as.factor(sex),
+         bachelors = as.factor(bachelors),
+         rel_family_id = as.factor(rel_family_id)) %>% 
+  mutate_if(is.numeric, scale)%>% 
+    drop_na())
+
+anova(bag_mod0, bag_mod1) # significant
+
+## Add SEDA Slope to Model
+bag_mod1.1 = lmer(bag ~  initial_age + log_inc_needs_RPP + bachelors + fes_youth_sum + age_c + 
+                 sex  + mean_pds  + comc_phenx_mean   + led_sch_seda_s_mn_coh_eb +   (1 |site_id_l/rel_family_id/subjectID), data=full_data_whole_brain %>% 
+  mutate(sex = as.factor(sex),
+         bachelors = as.factor(bachelors),
+         rel_family_id = as.factor(rel_family_id)) %>% 
+  mutate_if(is.numeric, scale)%>% 
+    drop_na())
+
+anova(bag_mod0, bag_mod1.1) # insignificant
+
+## Add SEDA * Sex Interaction
+bag_mod2 = lmer(bag ~  initial_age + log_inc_needs_RPP + bachelors + fes_youth_sum + age_c + 
+                    mean_pds  + comc_phenx_mean   + sex*led_sch_seda_s_mn_avg_eb +  (1 |site_id_l/rel_family_id/subjectID), data=full_data_whole_brain %>% 
+  mutate(sex = as.factor(sex),
+         bachelors = as.factor(bachelors),
+         rel_family_id = as.factor(rel_family_id)) %>% 
+  mutate_if(is.numeric, scale)%>% 
+    drop_na())
+
+anova(bag_mod2, bag_mod1) # not-significant (doesn't fit the data better)
+
+# Test age*seda interaction
+bag_mod2.2 = lmer(bag ~ initial_age + log_inc_needs_RPP + bachelors + fes_youth_sum + sex + 
+                    mean_pds  + comc_phenx_mean   + age_c*led_sch_seda_s_mn_avg_eb +  (1 |site_id_l/rel_family_id/subjectID), data=full_data_whole_brain %>% 
+  mutate(sex = as.factor(sex),
+         bachelors = as.factor(bachelors),
+         rel_family_id = as.factor(rel_family_id)) %>% 
+  mutate_if(is.numeric, scale)%>% 
+    drop_na())
+
+anova(bag_mod2.2, bag_mod1) # not-significant (doesn't fit the data better)
+
+summary(bag_mod1)
+```
+
+
+
+## Figure 3B
+
+```{r}
+
+## Plot to show seda effect
+
+resid_mod = lmer(bag ~  initial_age + log_inc_needs_RPP + bachelors + fes_youth_sum + age_c + 
+                 sex  + mean_pds  + comc_phenx_mean    +  (1 |site_id_l/rel_family_id/subjectID), data=full_data_whole_brain %>% 
+  mutate(sex = as.factor(sex),
+         bachelors = as.factor(bachelors),
+         rel_family_id = as.factor(rel_family_id)) %>% 
+  mutate_if(is.numeric, scale)%>% 
+    drop_na())
+
+test_df = full_data_whole_brain %>% 
+  mutate(sex = as.factor(sex),
+         bachelors = as.factor(bachelors),
+         rel_family_id = as.factor(rel_family_id))%>% 
+  drop_na() %>% 
+  mutate(bag_resid = residuals(resid_mod),
+         status=as.factor(ntile(led_sch_seda_s_mn_avg_eb,2)))%>% 
+  drop_na()
+
+top_vals = test_df %>% ungroup() %>%
+  # arrange(led_sch_seda_s_mn_avg_eb, .by_group=F)%>%
+  slice_max(prop=0.2, order_by=led_sch_seda_s_mn_avg_eb,with_ties=F) %>%
+  mutate(`SEDA Group`='High SEDA Intercept')
+
+bottom_vals = test_df %>% ungroup() %>%
+  # arrange(led_sch_seda_s_mn_avg_eb, .by_group=F)%>%
+  slice_min(prop=0.2, order_by=led_sch_seda_s_mn_avg_eb,with_ties=F) %>%
+  mutate(`SEDA Group`='Low SEDA Intercept')
+
+combo_df = top_vals %>% 
+  rbind(bottom_vals)
+
+test_df%>% 
+  rename(`SEDA Group` = status) %>% 
+  ggplot(aes(x=led_sch_seda_s_mn_avg_eb,y=bag,color=`SEDA Group`))+
+  geom_point()+
+  geom_smooth()+
+  ylab("BAG Residual")+
+  xlab("SEDA Intercept")+
+  theme_bw() 
+
+
+seda_group_plot = combo_df%>% 
+  # rename(`SEDA Group` = status) %>% 
+  group_by(`SEDA Group`) %>% 
+  summarise(mean_bag = mean(bag_resid, na.rm=T),
+            sd_bag = sd(bag_resid,na.rm = T),
+            se = sd(bag_resid,na.rm=T)/sqrt(n()),
+            L95 = mean(bag_resid, na.rm=T) - 1.96 * sd(bag_resid,na.rm = T) / sqrt(n()), 
+            U95 = mean(bag_resid, na.rm=T) + 1.96 * sd(bag_resid,na.rm = T) / sqrt(n()))%>% 
+  ggplot(aes(x=`SEDA Group`,y=mean_bag,fill=`SEDA Group`))+
+  geom_col()+
+  geom_errorbar(aes(ymin=mean_bag-se, ymax=mean_bag+se),width = 0.10)+
+  ylab("Mean Residualized BAG")+
+  theme_bw() +
+    scale_fill_brewer(palette="Set1")+
+  theme(legend.position = "bottom",
+        legend.text=element_text(size=18))+
+  theme(axis.text=element_text(size=18),
+        axis.title=element_text(size=22),
+        axis.title.x=element_blank())
+
+
+```
+
+
+

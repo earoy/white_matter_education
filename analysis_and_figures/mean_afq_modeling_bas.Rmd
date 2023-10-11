@@ -1,0 +1,503 @@
+---
+title: "Mean Diffusion Modeling ABCD - Baseline"
+author: "Ethan Roy"
+output: html_document
+---
+
+
+```{r setup, include=FALSE}
+
+knitr::opts_chunk$set(echo = TRUE)
+library(dplyr)
+library(lme4)
+library(nlme)
+library(tidyverse)
+library(ggplot2)
+library(emmeans)
+library(sjPlot)
+library(sjmisc)
+library(MuMIn)
+library(mlVAR)
+library(effects)
+library(lmerTest)
+library(corrplot)
+library(patchwork)
+library(ggpubr)
+library(scales)
+
+```
+
+## Load Data
+
+```{r, include=F}
+
+
+## All data except pyAFQ outputs are available through the ABCD data repository
+## https://nda.nih.gov/abcd/
+
+full_data_bas_orig = read.csv('/Users/Ethan/Documents/Stanford/afq/abcd/data/harmonized_mean_baseline.csv') # n = 7,972, 5,631 w/ all data
+
+dti_df = read_tsv('/Users/Ethan/Documents/Stanford/EdNeuro/ABCD_smarte/data/abcd_dmdtifp201.txt') %>% slice(-1)
+dti_df = dti_df %>% select(src_subject_id,interview_age,eventname) %>% 
+  rename(sessionID=eventname,
+         subjectID=src_subject_id,
+         age = interview_age) %>% 
+  mutate(sessionID = case_when(sessionID=='2_year_follow_up_y_arm_1'~'Year 2',
+                               sessionID=='baseline_year_1_arm_1'~'Baseline')) %>%
+  mutate(age=as.numeric(age)/12) %>% 
+  group_by(subjectID) %>% 
+  mutate(initial_age = min(age)) %>% 
+  ungroup() %>% 
+  mutate(age_c= age-initial_age) %>% 
+  select(subjectID,initial_age)
+
+
+family_df = read_csv('/Users/Ethan/Documents/Stanford/afq/abcd/data/family_info.csv')
+family_df = family_df %>% 
+  filter(event_name == 'baseline_year_1_arm_1')%>%
+  select(src_subject_id,rel_family_id) %>% 
+  unique() %>% 
+  rename(subjectID=src_subject_id) 
+
+scanner_info_df = read_csv('/Users/Ethan/Documents/Stanford/afq/abcd/data/scanner_info.csv')
+scanner_info_df = scanner_info_df %>% 
+  select(src_subject_id,mri_info_manufacturer,mri_info_manufacturers.model.name,
+         mri_info_device.serial.number,mri_info_software.version) %>% 
+  drop_na() %>% 
+  unique() %>% 
+  unite('scanner_make_model',mri_info_manufacturer:mri_info_manufacturers.model.name, sep="_")%>% 
+  rename(subjectID=src_subject_id) %>% 
+  mutate(scanner_make_model=as.factor(scanner_make_model),
+         mri_info_device.serial.number=as.factor(mri_info_device.serial.number),
+         mri_info_software.version = as.factor(mri_info_software.version)) %>% 
+  unite('scanner_make_model_soft',scanner_make_model:mri_info_software.version, sep="_")
+
+demo_info = read_csv('/Users/Ethan/Documents/Stanford/afq/abcd/data/subjects.csv')
+
+ses_env_df = read_csv('/Users/Ethan/Documents/Stanford/afq/abcd/data/ses_env_info.csv') %>% 
+  select(-c(site_id_l,demo_prnt_income_v2,demo_prnt_ed_v2))%>%
+  mutate(subjectID = substring(subjectID,5)) %>% 
+  filter(sessionID == 'ses-baseline_year_1_arm_1')
+
+
+full_data_bas_orig = full_data_bas_orig %>%
+  mutate(subjectID = substring(subjectID,5)) %>%
+  inner_join(dti_df , by=c('subjectID'))%>%
+inner_join(demo_info, by='subjectID') %>%
+inner_join(family_df, by='subjectID') %>%
+inner_join(ses_env_df, by=c('subjectID')) %>%
+  distinct() 
+
+
+
+```
+
+## Univariate Relationships
+
+### Figure 1A
+
+```{r}
+
+testRes = full_data_bas_orig %>% 
+  filter(tractID=='ARC_L') %>% 
+  select(dki_fa, initial_age, log_inc_needs_RPP, bachelors, fes_youth_sum ,
+         sex, mean_pds, comc_phenx_mean, led_sch_seda_s_mn_avg_eb) %>% 
+  mutate(bachelors = as.numeric(bachelors)) %>% drop_na() %>% 
+  rename(`Parental Education` = bachelors,
+         `Left Arcuate FA` = dki_fa,
+         Age = initial_age,
+         `SEDA Intercept` = led_sch_seda_s_mn_avg_eb,
+         `Income-to-Needs` = log_inc_needs_RPP,
+         `Pubertal Status` = mean_pds,
+         `Home Environment` = fes_youth_sum,
+         `Neighborhood Cohesion` = comc_phenx_mean,
+         Sex = sex) %>%
+  cor.mtest(conf.level = 0.95)
+
+corrMatOrder = full_data_bas_orig %>% 
+  filter(tractID=='ARC_L') %>% 
+  select(dki_fa, initial_age, log_inc_needs_RPP, bachelors, fes_youth_sum ,
+         sex, mean_pds, comc_phenx_mean, led_sch_seda_s_mn_avg_eb) %>% 
+  mutate(bachelors = as.numeric(bachelors)) %>% drop_na() %>% 
+  rename(`Parental Education` = bachelors,
+         `Left Arcuate FA` = dki_fa,
+         Age = initial_age,
+         `SEDA Intercept` = led_sch_seda_s_mn_avg_eb,
+         `Income-to-Needs` = log_inc_needs_RPP,
+         `Pubertal Status` = mean_pds,
+         `Home Environment` = fes_youth_sum,
+         `Neighborhood Cohesion` = comc_phenx_mean,
+         Sex = sex) %>% 
+  cor() %>% 
+  corrMatOrder(order='FPC')
+
+pAdj <- p.adjust(testRes$p, method = "bonferroni")
+resAdj <- matrix(pAdj, ncol = dim(testRes$p)[1])
+colnames(resAdj) = colnames(testRes$p)
+rownames(resAdj) = rownames(testRes$p)
+resAdj = resAdj[corrMatOrder,corrMatOrder]
+
+## Set up color matrix based on whether the p_adj is significant or not
+significant_color <- "black"
+insignificant_color <- "grey50"
+addCoef_col <- ifelse(resAdj < 0.05, significant_color, insignificant_color)
+
+off_diagonal_color <- addCoef_col[which(!row(addCoef_col) == col(addCoef_col), arr.ind = TRUE)]
+
+## Set up color matrix based on whether the p_adj is significant or not
+significant_size <- 0.7
+insignificant_size <- 0.65
+addCoef_size <- ifelse(resAdj < 0.05, significant_size, insignificant_size)
+
+off_diagonal_size <- addCoef_size[which(!row(addCoef_size) == col(addCoef_size), arr.ind = TRUE)]
+
+## When diag==FALSE, the indices of the color matrix get messed up so we have to
+## grab the colors from our coefficient colors on the off diagonal indices
+
+corr_mat = full_data_bas_orig %>% 
+  filter(tractID=='ARC_L') %>% 
+  select(dki_fa, initial_age, log_inc_needs_RPP, bachelors, fes_youth_sum ,
+         sex, mean_pds, comc_phenx_mean, led_sch_seda_s_mn_avg_eb) %>% 
+  mutate(bachelors = as.numeric(bachelors)) %>% drop_na() %>% 
+  rename(`Parental Education` = bachelors,
+         `Left Arcuate FA` = dki_fa,
+         Age = initial_age,
+         `SEDA Intercept` = led_sch_seda_s_mn_avg_eb,
+         `Income-to-Needs` = log_inc_needs_RPP,
+         `Pubertal Status` = mean_pds,
+         `Home Environment` = fes_youth_sum,
+         `Neighborhood Cohesion` = comc_phenx_mean,
+         Sex = sex) %>% 
+  cor()
+
+corr_mat = corr_mat[corrMatOrder,corrMatOrder]
+diag(corr_mat)<-0
+
+corr_mat %>% 
+  corrplot(type='full', 
+           cl.pos = 'b', col.lim=c(-.6,.6),is.corr=FALSE, # format color bar
+           tl.pos = 'lt',tl.srt = 45, tl.cex=0.7,tl.col='black',# format titles
+           addCoef.col = off_diagonal_color, # conditionally color r values
+           number.cex = off_diagonal_size,col = COL2('PRGn'),
+           diag = FALSE, method='color')
+
+```
+
+### Figure 1B
+
+```{r}
+
+predictor_cols = c('initial_age', 'log_inc_needs_RPP', 'bachelors', 'fes_youth_sum',
+                   'sex', 'mean_pds', 'comc_phenx_mean', 'led_sch_seda_s_mn_avg_eb')
+
+model_results_df =data.frame(
+                             predictor=character(),
+                             beta=double(),
+                             p_val=double(),
+                             std_err=double(),
+                             neg_log10p=double(),
+                             stringsAsFactors=T)
+
+mod_data = full_data_bas_orig %>% 
+  filter(tractID=='ARC_L') %>% 
+  select(dki_fa, initial_age, log_inc_needs_RPP, bachelors, fes_youth_sum ,
+         sex, mean_pds, comc_phenx_mean, led_sch_seda_s_mn_avg_eb,site_id_l,
+         rel_family_id) %>% 
+  mutate(bachelors = as.numeric(bachelors)) %>% drop_na() 
+
+## Run lmer with each predictor individually
+
+for (predictor in predictor_cols) {
+
+  mod = lmer(formula(paste("dki_fa ~ ", paste(predictor,'+ (1 |site_id_l/rel_family_id)'))), 
+             data=mod_data)
+  # summary(mod)
+  res = as.data.frame(summary(mod)$coefficients)%>%
+  rownames_to_column("predictor") %>%
+  select(predictor, Estimate,`Pr(>|t|)`,`Std. Error`) %>%
+  rename(beta = Estimate,
+         pval = `Pr(>|t|)`,
+         std_err = `Std. Error`) %>% 
+  mutate(neg_log10p = -log10(pval)) %>% 
+    filter(predictor!='(Intercept)')
+  
+  model_results_df = rbind(model_results_df,res)
+}
+
+
+arc_l_single_mod_plot = model_results_df %>% 
+  mutate( sig_corr = as.factor(if_else(p.adjust(pval,method='fdr')>0.05, 0, 1))) %>%
+  unique() %>% 
+    filter((predictor == 'fes_youth_sum')|
+           (predictor == 'sex')|
+           (predictor == 'interview_age')|
+           (predictor == 'led_sch_seda_s_mn_coh_eb')|
+           (predictor == 'led_sch_seda_s_mn_avg_eb')|
+           (predictor == 'log_inc_needs_RPP')|
+           (predictor == 'comc_phenx_mean')|
+           (predictor == 'mean_pds')|
+           (predictor == 'bachelors'))%>% 
+  mutate(predictor = case_when(predictor=='bachelors'~'Parental \n Education',
+                               predictor=='log_inc_needs_RPP'~'Income-to- \nNeeds',
+                               predictor=='interview_age'~'Age',
+                               predictor=='led_sch_seda_s_mn_avg_eb'~'SEDA \n Intercept',
+                               predictor=='led_sch_seda_s_mn_coh_eb'~'SEDA \n Slope',
+                               predictor=='mean_pds'~'Pubertal \n Status',
+                               predictor=='fes_youth_sum'~'Home \n Environment',
+                               predictor=='comc_phenx_mean'~'Neighborhood \n Cohesion',
+                               predictor=='sex'~'Sex')) %>% 
+  ggplot(aes(x=predictor,y=beta,fill=predictor,alpha=sig_corr))+
+  geom_col() +
+  geom_hline(yintercept=0,color='black',linetype = "dashed")+
+  geom_errorbar(aes(ymin=beta-std_err,ymax=beta+std_err),width=0.2)+
+  theme_bw()+
+  theme(axis.text.x = element_text(angle = 0, vjust = 0.5, hjust=0.5))+
+  theme(legend.position = "right")+
+  guides(fill=FALSE) +
+  scale_alpha_manual(values = c("0"=0.2, "1" = 1),guide = "none")+
+  theme(legend.key.height= unit(.4, 'cm'),
+        legend.key.width= unit(1, 'cm'))+
+  xlab("")+
+  ylab("Beta Weight")+
+  ggtitle("Left Arcuate")+
+  theme(plot.title = element_text(hjust = 0.5)) +
+  scale_fill_manual(values=hue_pal()(8)[2:8])
+
+
+predictor_cols = c('initial_age', 'log_inc_needs_RPP', 'bachelors', 'fes_youth_sum',
+                   'sex', 'mean_pds', 'comc_phenx_mean', 'led_sch_seda_s_mn_avg_eb')
+
+model_results_df =data.frame(
+                             predictor=character(),
+                             beta=double(),
+                             p_val=double(),
+                             std_err=double(),
+                             neg_log10p=double(),
+                             stringsAsFactors=T)
+
+mod_data = full_data_bas_orig %>% 
+  filter(tractID=='ARC_R') %>% 
+  select(dki_fa, initial_age, log_inc_needs_RPP, bachelors, fes_youth_sum ,
+         sex, mean_pds, comc_phenx_mean, led_sch_seda_s_mn_avg_eb,site_id_l,
+         rel_family_id) %>% 
+  mutate(bachelors = as.numeric(bachelors)) %>% drop_na() 
+
+## Run lmer with each predictor individually
+
+for (predictor in predictor_cols) {
+
+  mod = lmer(formula(paste("dki_fa ~ ", paste(predictor,'+ (1 |site_id_l/rel_family_id)'))), 
+             data=mod_data)
+  # summary(mod)
+  res = as.data.frame(summary(mod)$coefficients)%>%
+  rownames_to_column("predictor") %>%
+  select(predictor, Estimate,`Pr(>|t|)`,`Std. Error`) %>%
+  rename(beta = Estimate,
+         pval = `Pr(>|t|)`,
+         std_err = `Std. Error`) %>% 
+  mutate(neg_log10p = -log10(pval)) %>% 
+    filter(predictor!='(Intercept)')
+  
+  model_results_df = rbind(model_results_df,res)
+}
+
+
+arc_r_single_mod_plot = model_results_df %>% 
+  mutate( sig_corr = as.factor(if_else(p.adjust(pval,method='fdr')>0.05, 0, 1))) %>%
+  unique() %>% 
+    filter((predictor == 'fes_youth_sum')|
+           (predictor == 'sex')|
+           (predictor == 'interview_age')|
+           (predictor == 'led_sch_seda_s_mn_coh_eb')|
+           (predictor == 'led_sch_seda_s_mn_avg_eb')|
+           (predictor == 'log_inc_needs_RPP')|
+           (predictor == 'comc_phenx_mean')|
+           (predictor == 'mean_pds')|
+           (predictor == 'bachelors'))%>% 
+  mutate(predictor = case_when(predictor=='bachelors'~'Parental \n Education',
+                               predictor=='log_inc_needs_RPP'~'Income-to- \nNeeds',
+                               predictor=='interview_age'~'Age',
+                               predictor=='led_sch_seda_s_mn_avg_eb'~'SEDA \n Intercept',
+                               predictor=='led_sch_seda_s_mn_coh_eb'~'SEDA \n Slope',
+                               predictor=='mean_pds'~'Pubertal \n Status',
+                               predictor=='fes_youth_sum'~'Home \n Environment',
+                               predictor=='comc_phenx_mean'~'Neighborhood \n Cohesion',
+                               predictor=='sex'~'Sex')) %>% 
+  ggplot(aes(x=predictor,y=beta,fill=predictor,alpha=sig_corr))+
+  geom_col() +
+  geom_hline(yintercept=0,color='black',linetype = "dashed")+
+  geom_errorbar(aes(ymin=beta-std_err,ymax=beta+std_err),width=0.2)+
+  theme_bw()+
+  theme(axis.text.x = element_text(angle = 0, vjust = 0.5, hjust=0.5))+
+  theme(legend.position = "right")+
+  guides(fill=FALSE) +
+  scale_alpha_manual(values = c("0"=0.2, "1" = 1),guide = "none")+
+  theme(legend.key.height= unit(.4, 'cm'),
+        legend.key.width= unit(1, 'cm'))+
+  xlab("")+
+  ylab("Beta Weight")+
+  ggtitle("Right Arcuate")+
+  theme(plot.title = element_text(hjust = 0.5))+
+  scale_fill_manual(values=hue_pal()(8)[2:8])
+
+
+
+combo_plot = (arc_l_single_mod_plot / arc_r_single_mod_plot)
+
+p_ranges_y <- c(ggplot_build(combo_plot[[1]])$layout$panel_scales_y[[1]]$range$range,
+                ggplot_build(combo_plot[[2]])$layout$panel_scales_y[[1]]$range$range)
+
+combo_plot & 
+  ylim(min(p_ranges_y), max(p_ranges_y))
+
+```
+
+
+
+### Multivariate Relationships
+
+## Figure 2B
+
+```{r}
+
+
+tracts = unique((full_data_bas_orig %>% 
+                   filter(tractID!='FA') %>% 
+                   filter(tractID!='FP'))$tractID)
+
+model_results_df =data.frame(tractID=character(),
+                             predictor=character(),
+                             beta=double(),
+                             std_error=double(),
+                             p_val=double(),
+                             neg_log10p=double(),
+                             stringsAsFactors=T)
+
+for (tract in tracts) {
+
+  tract_df = full_data_bas_orig %>% 
+    filter(tractID==tract) %>% 
+    mutate(interview_age = interview_age/12)
+
+  result = tryCatch({
+    
+      bas_mod = lmer(dki_fa ~ interview_age + log_inc_needs_RPP + bachelors + fes_youth_sum + 
+                 sex  + mean_pds  + comc_phenx_mean + led_sch_seda_s_mn_avg_eb  + (1 |site_id_l/rel_family_id), data=tract_df)
+     modeltype='subject re'
+     
+    res = as.data.frame(summary(bas_mod)$coefficients) %>%
+    rownames_to_column("predictor") %>%
+    select(predictor, Estimate,`Pr(>|t|)`,`Std. Error`) %>%
+    mutate(neg_log10p = -log10(`Pr(>|t|)`),
+           std_error=`Std. Error`,
+           tractID = tract,
+           modtype=modeltype) 
+         
+  }, warning = function(w){
+    print('warning')
+    bas_mod = lmer(dki_fa ~ interview_age + log_inc_needs_RPP + bachelors + fes_youth_sum + 
+                 sex  + mean_pds  + comc_phenx_mean + led_sch_seda_s_mn_avg_eb  + (1 |site_id_l/rel_family_id), data=tract_df)
+    modeltype='subject re'
+    
+    res = as.data.frame(summary(bas_mod)$coefficients) %>%
+    rownames_to_column("predictor") %>%
+    select(predictor, Estimate,`Pr(>|t|)`,`Std. Error`) %>%
+    mutate(neg_log10p = -log10(`Pr(>|t|)`),
+           std_error=`Std. Error`,
+           tractID = tract,
+           modtype=modeltype) 
+
+  }, error = function(e){
+    print('error')
+    bas_mod = lmer(dki_fa ~ interview_age + log_inc_needs_RPP + bachelors + fes_youth_sum + 
+                 sex  + mean_pds  + comc_phenx_mean + led_sch_seda_s_mn_avg_eb + (1 |site_id_l/rel_family_id), data=tract_df)
+    modeltype='no subject re'
+    
+    res = as.data.frame(summary(bas_mod)$coefficients) %>%
+    rownames_to_column("predictor") %>%
+    select(predictor, Estimate,`Pr(>|t|)`,`Std. Error`) %>%
+    mutate(neg_log10p = -log10(`Pr(>|t|)`),
+           std_error=`Std. Error`,
+           tractID = tract,
+           modtype=modeltype)
+  })
+
+  print(paste0("adding ",tract))
+  model_results_df = rbind(model_results_df,result)
+  
+  # rm(tract_df, res,bas_mod)
+  rm(tract_df, res,result)
+
+}
+
+
+bundle_order = c(
+    "VOF_R",
+    "pARC_R",
+    "ARC_R",
+    "ATR_R",
+    "CST_R",
+    "IFO_R",
+    "ILF_R",
+    "SLF_R",
+    "UNC_R",
+    "CGC_R",
+    "Orbital", "AntFrontal", "SupFrontal", "Motor",
+    "SupParietal", "PostParietal", "Temporal", "Occipital",
+    "CGC_L",
+    "UNC_L",
+    "SLF_L",
+    "ILF_L",
+    "IFO_L",
+    "CST_L",
+    "ATR_L",
+    "ARC_L",
+    "pARC_L",
+    "VOF_L"
+)
+
+model_results_df  %>%
+  mutate( sig_corr = as.factor(if_else(p.adjust(`Pr(>|t|)`,method='fdr')>0.05, 0, 1)),
+          p_adj = p.adjust(`Pr(>|t|)`,method='fdr')) %>% 
+  write_csv('/Users/Ethan/Documents/Stanford/afq/abcd/data/baseline_fa_model_output_updated_ses_no_qsi_prep_fa_int.csv')
+
+model_results_df  %>%
+  mutate( sig_corr = as.factor(if_else(p.adjust(`Pr(>|t|)`,method='fdr')>0.05, 0, 1))) %>%
+    filter((predictor == 'fes_youth_sum')|
+           (predictor == 'sex')|
+           (predictor == 'interview_age')|
+           (predictor == 'led_sch_seda_s_mn_coh_eb')|
+           (predictor == 'led_sch_seda_s_mn_avg_eb')|
+           (predictor == 'log_inc_needs_RPP')|
+           (predictor == 'comc_phenx_mean')|
+           (predictor == 'mean_pds')|
+           (predictor == 'bachelorsTRUE'))%>% 
+  mutate(predictor = case_when(predictor=='bachelorsTRUE'~'Parental \n Education',
+                               predictor=='log_inc_needs_RPP'~'Income-to- \nNeeds',
+                               predictor=='interview_age'~'Age',
+                               predictor=='led_sch_seda_s_mn_avg_eb'~'SEDA \n Intercept',
+                               predictor=='led_sch_seda_s_mn_coh_eb'~'SEDA \n Slope',
+                               predictor=='mean_pds'~'Pubertal \n Status',
+                               predictor=='fes_youth_sum'~'Home \n Environment',
+                               predictor=='comc_phenx_mean'~'Neighborhood \n Cohesion',
+                               predictor=='sex'~'Sex')) %>% 
+  transform( tractID = factor(tractID, levels = bundle_order)) %>% 
+  ggplot(aes(x=tractID,y=Estimate,fill=predictor,alpha=sig_corr))+
+  geom_col() +
+  geom_hline(yintercept=0,color='black',linetype = "dashed")+
+  geom_errorbar(aes(ymin=Estimate-std_error,ymax=Estimate+std_error),width=0.2)+
+  theme_bw()+
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1))+
+  facet_grid(predictor~., scales='free_y')+
+  theme(legend.position = "bottom")+
+  scale_alpha_manual(values = c("0"=0.2, "1" = 1),guide = "none")+
+  theme(legend.key.height= unit(.4, 'cm'),
+        legend.key.width= unit(1, 'cm'))+
+  theme(strip.text.x = element_text(size = 5))
+
+
+```
+
+
+
+
